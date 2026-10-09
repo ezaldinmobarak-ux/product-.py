@@ -1,0 +1,28 @@
+services:
+  - type: worker
+    name: shop-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    disk:
+      name: shop-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: SHOP_NAME
+        sync: false
+      - key: DB_PATH
+        value: /var/data/shop.db
+      - key: TIMEZONE
+        value: Africa/Khartoum
+      - key: CURRENCY
+        value: جنيه
+      - key: LOW_STOCK_LIMIT
+        value: "5"
+      - key: BACKUP_HOUR
+        value: "23"
