@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: Background worker
     name: shop-bot
     runtime: python
     plan: starter
