@@ -1,4 +1,4 @@
-import logging
+hereimport logging
 import os
 import re
 import shutil
@@ -1690,6 +1690,35 @@ def text_state(handler):
     return [MessageHandler(TEXT_STATE, handler)]
 
 
+def run_render_webhook(application):
+    """تشغيل البوت عبر Webhook على خدمة Render Web Service."""
+    base_url = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+    if not base_url.startswith("https://"):
+        raise RuntimeError(
+            "WEBHOOK_URL أو RENDER_EXTERNAL_URL يجب أن يكون رابطًا عامًا يبدأ بـ https://"
+        )
+
+    secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
+        raise RuntimeError(
+            "اضبط TELEGRAM_WEBHOOK_SECRET على رمز من 1 إلى 256 حرفًا/رقمًا أو _ أو -."
+        )
+
+    path = (os.getenv("WEBHOOK_PATH", "telegram").strip().strip("/") or "telegram")
+    port = int(os.getenv("PORT", "10000"))
+    webhook_url = f"{base_url}/{path}"
+
+    logger.info("Starting Telegram webhook on 0.0.0.0:%s at /%s", port, path)
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=path,
+        webhook_url=webhook_url,
+        secret_token=secret,
+        bootstrap_retries=-1,
+    )
+
+
 def conversation(entry_text, entry_handler, states):
     return ConversationHandler(
         entry_points=[MessageHandler(button(entry_text), entry_handler)],
@@ -1715,7 +1744,7 @@ def main():
         logger.warning(
             "OWNER_ID غير مضبوط. البوت في وضع الإعداد: أرسل /myid ثم ضع الرقم في OWNER_ID."
         )
-        application.run_polling()
+        run_render_webhook(application)
         return
 
     application.add_handler(CommandHandler("start", start, filters=ALLOWED))
@@ -1789,8 +1818,8 @@ def main():
     else:
         logger.warning("JobQueue غير متاح: ثبّت python-telegram-bot[job-queue].")
 
-    logger.info("%s bot is running...", SHOP_NAME)
-    application.run_polling()
+    logger.info("%s bot is running with Telegram webhook...", SHOP_NAME)
+    run_render_webhook(application)
 
 
 if __name__ == "__main__":
