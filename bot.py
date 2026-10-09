@@ -1603,4 +1603,195 @@ async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             SELECT COALESCE((SELECT SUM(debt_amount) FROM sales WHERE customer_id = ?), 0)
                  - COALESCE((SELECT SUM(amount) FROM payments WHERE customer_id = ?), 0)
             """,
-            (customer_id, 
+            (customer_id, customer_id),
+        ).fetchone()[0]
+
+        if owed > 0:
+            connection.rollback()
+            await update.message.reply_text(
+                "تم إيقاف الحذف لأن العميل عليه دين الآن.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+        else:
+            cursor.execute(
+                "UPDATE sales SET customer_id = NULL WHERE customer_id = ?",
+                (customer_id,),
+            )
+            cursor.execute(
+                "UPDATE payments SET customer_id = NULL WHERE customer_id = ?",
+                (customer_id,),
+            )
+            cursor.execute("DELETE FROM customers WHERE id = ?", (customer_id,))
+            connection.commit()
+            await update.message.reply_text(
+                f"تم حذف العميل {customer_name}.", reply_markup=MAIN_KEYBOARD
+            )
+    except Exception as error:
+        connection.rollback()
+        logger.exception("delete failed")
+        await update.message.reply_text(
+            f"فشل الحذف: {error}", reply_markup=MAIN_KEYBOARD
+        )
+    finally:
+        connection.close()
+        context.user_data.clear()
+
+    return ConversationHandler.END
+
+
+# ============================================================
+# الأوامر العامة
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"أهلاً بك في {SHOP_NAME}.\n\nاختر العملية:",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user:
+        await update.message.reply_text(f"Telegram User ID:\n\n{user.id}")
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "تم إلغاء العملية الحالية. اضغط الزر المطلوب للبدء من جديد.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+    return ConversationHandler.END
+
+
+async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("اختر من القائمة:", reply_markup=MAIN_KEYBOARD)
+
+
+async def deny(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text("هذا البوت مخصص لأصحاب المحل فقط.")
+
+
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled error", exc_info=context.error)
+
+
+# ============================================================
+# التشغيل
+# ============================================================
+
+def button(text):
+    return filters.Regex("^" + re.escape(text) + "$") & ALLOWED
+
+
+def text_state(handler):
+    return [MessageHandler(TEXT_STATE, handler)]
+
+
+def conversation(entry_text, entry_handler, states):
+    return ConversationHandler(
+        entry_points=[MessageHandler(button(entry_text), entry_handler)],
+        states=states,
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(MENU_FILTER, cancel),
+        ],
+    )
+
+
+def main():
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN غير موجود في متغيرات البيئة.")
+
+    init_database()
+
+    application = Application.builder().token(TOKEN).build()
+    application.add_error_handler(on_error)
+    application.add_handler(CommandHandler("myid", myid))
+
+    if not ALLOWED_IDS:
+        logger.warning(
+            "OWNER_ID غير مضبوط. البوت في وضع الإعداد: أرسل /myid ثم ضع الرقم في OWNER_ID."
+        )
+        application.run_polling()
+        return
+
+    application.add_handler(CommandHandler("start", start, filters=ALLOWED))
+
+    application.add_handler(conversation(BTN_SALE, sale_start, {
+        SALE_ITEM: text_state(sale_item),
+        SALE_PICK: text_state(sale_item),
+        SALE_QTY: text_state(sale_qty),
+        SALE_MORE: text_state(sale_more),
+        SALE_CUSTOMER: text_state(sale_customer),
+        SALE_PAYMENT: text_state(sale_payment),
+        SALE_PAID: text_state(sale_paid),
+    }))
+
+    application.add_handler(conversation(BTN_DEBT_PAY, debt_start, {
+        DEBT_NAME: text_state(debt_name),
+        DEBT_AMOUNT: text_state(debt_amount),
+        DEBT_METHOD: text_state(debt_method),
+    }))
+
+    application.add_handler(conversation(BTN_ADD_PRODUCT, product_add_start, {
+        PROD_NAME: text_state(product_add_name),
+        PROD_PRICE: text_state(product_add_price),
+        PROD_COST: text_state(product_add_cost),
+        PROD_STOCK: text_state(product_add_stock),
+    }))
+
+    application.add_handler(conversation(BTN_RESTOCK, restock_start, {
+        RESTOCK_ITEM: text_state(restock_item),
+        RESTOCK_PICK: text_state(restock_item),
+        RESTOCK_QTY: text_state(restock_qty),
+        RESTOCK_COST: text_state(restock_cost),
+    }))
+
+    application.add_handler(conversation(BTN_PRICE, price_start, {
+        PRICE_ITEM: text_state(price_item),
+        PRICE_PICK: text_state(price_item),
+        PRICE_VALUE: text_state(price_value),
+    }))
+
+    application.add_handler(conversation(BTN_SEARCH, search_start, {
+        SEARCH_NAME: text_state(search_name),
+    }))
+
+    application.add_handler(conversation(BTN_DELETE, delete_start, {
+        DELETE_NAME: text_state(delete_name),
+        DELETE_CONFIRM: text_state(delete_confirm),
+    }))
+
+    application.add_handler(MessageHandler(button(BTN_PRODUCTS), products_list))
+    application.add_handler(MessageHandler(button(BTN_LOW), low_stock_list))
+    application.add_handler(MessageHandler(button(BTN_CUSTOMERS), customers_list))
+    application.add_handler(MessageHandler(button(BTN_DEBTS), debts_list))
+    application.add_handler(MessageHandler(button(BTN_TODAY), today_report))
+    application.add_handler(MessageHandler(button(BTN_MONTH), month_report))
+    application.add_handler(MessageHandler(button(BTN_BACKUP), backup_command))
+    application.add_handler(MessageHandler(button(BTN_CANCEL), cancel))
+
+    application.add_handler(
+        MessageHandler(ALLOWED & filters.TEXT & ~filters.COMMAND, unknown_text)
+    )
+    application.add_handler(MessageHandler(~ALLOWED, deny))
+
+    if application.job_queue:
+        application.job_queue.run_daily(
+            scheduled_backup,
+            time=time(hour=BACKUP_HOUR, minute=0, tzinfo=TZ),
+            data=ALLOWED_IDS[0],
+            name="daily_backup",
+        )
+    else:
+        logger.warning("JobQueue غير متاح: ثبّت python-telegram-bot[job-queue].")
+
+    logger.info("%s bot is running...", SHOP_NAME)
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
