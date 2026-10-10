@@ -58,16 +58,10 @@ ALLOWED = filters.User(user_id=ALLOWED_IDS) if ALLOWED_IDS else None
 # نصوص الأزرار
 # ============================================================
 
-BTN_SALE = "بيع جديد"
+BTN_DEBT_NEW = "تسجيل دين جديد"
 BTN_DEBT_PAY = "تسديد دين"
-BTN_ADD_PRODUCT = "إضافة منتج"
-BTN_RESTOCK = "توريد مخزون"
-BTN_PRODUCTS = "المنتجات"
-BTN_LOW = "نواقص المخزون"
 BTN_CUSTOMERS = "العملاء"
 BTN_DEBTS = "الديون"
-BTN_SEARCH = "بحث عن عميل"
-BTN_PRICE = "تعديل سعر"
 BTN_TODAY = "تقرير اليوم"
 BTN_MONTH = "تقرير الشهر"
 BTN_DELETE = "حذف عميل"
@@ -75,9 +69,8 @@ BTN_BACKUP = "نسخ احتياطي"
 BTN_CANCEL = "إلغاء"
 
 MENU_TEXTS = [
-    BTN_SALE, BTN_DEBT_PAY, BTN_ADD_PRODUCT, BTN_RESTOCK, BTN_PRODUCTS,
-    BTN_LOW, BTN_CUSTOMERS, BTN_DEBTS, BTN_SEARCH, BTN_PRICE, BTN_TODAY,
-    BTN_MONTH, BTN_DELETE, BTN_BACKUP, BTN_CANCEL,
+    BTN_DEBT_NEW, BTN_DEBT_PAY, BTN_CUSTOMERS, BTN_DEBTS,
+    BTN_TODAY, BTN_MONTH, BTN_DELETE, BTN_BACKUP, BTN_CANCEL,
 ]
 
 PAY_CASH = "كاش"
@@ -95,11 +88,8 @@ TEXT_STATE = filters.TEXT & ~filters.COMMAND & ~MENU_FILTER
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [BTN_SALE, BTN_DEBT_PAY],
-        [BTN_ADD_PRODUCT, BTN_RESTOCK],
-        [BTN_PRODUCTS, BTN_LOW],
+        [BTN_DEBT_NEW, BTN_DEBT_PAY],
         [BTN_CUSTOMERS, BTN_DEBTS],
-        [BTN_SEARCH, BTN_PRICE],
         [BTN_TODAY, BTN_MONTH],
         [BTN_DELETE, BTN_BACKUP],
         [BTN_CANCEL],
@@ -119,27 +109,9 @@ CASH_ONLY_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-MORE_KEYBOARD = ReplyKeyboardMarkup(
-    [[MORE_ITEM, FINISH_SALE], [BTN_CANCEL]],
-    resize_keyboard=True,
-)
-
-CUSTOMER_KEYBOARD = ReplyKeyboardMarkup(
-    [[WALK_IN], [BTN_CANCEL]],
-    resize_keyboard=True,
-)
-
-# حالات المحادثات
-(
-    SALE_ITEM, SALE_PICK, SALE_QTY, SALE_MORE, SALE_CUSTOMER,
-    SALE_PAYMENT, SALE_PAID,
-    DEBT_NAME, DEBT_AMOUNT, DEBT_METHOD,
-    PROD_NAME, PROD_PRICE, PROD_COST, PROD_STOCK,
-    RESTOCK_ITEM, RESTOCK_PICK, RESTOCK_QTY, RESTOCK_COST,
-    PRICE_ITEM, PRICE_PICK, PRICE_VALUE,
-    SEARCH_NAME,
-    DELETE_NAME, DELETE_CONFIRM,
-) = range(24)
+# حالات المحادثات المستخدمة في نسخة إدارة الديون
+DEBT_NAME, DEBT_AMOUNT, DEBT_METHOD, DELETE_NAME, DELETE_CONFIRM = range(5)
+NEW_DEBT_NAME, NEW_DEBT_ITEM, NEW_DEBT_AMOUNT = range(5, 8)
 
 # ============================================================
 # أدوات عامة
@@ -206,6 +178,69 @@ async def send_long(update, header, lines, keyboard=None):
 # ============================================================
 # العملاء والديون
 # ============================================================
+
+def ensure_debt_details_table():
+    """يحفظ وصف السلعة مع سجل الدين دون ربطه بجدول المنتجات أو المخزون."""
+    connection = get_connection()
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS debt_details (
+                sale_id INTEGER PRIMARY KEY,
+                product_description TEXT NOT NULL,
+                amount NUMERIC NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def register_direct_debt(customer_id, customer_name, description, amount):
+    """يسجل الدين ووصفه، وينشئ العميل الجديد في المعاملة نفسها عند الحاجة."""
+    connection = get_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        created_at = now()
+        if customer_id is None:
+            row = cursor.execute(
+                "SELECT id FROM customers WHERE name = ?", (customer_name,)
+            ).fetchone()
+            if row:
+                customer_id = row["id"]
+            else:
+                cursor.execute(
+                    "INSERT INTO customers (name, created_at) VALUES (?, ?)",
+                    (customer_name, created_at),
+                )
+                customer_id = cursor.lastrowid
+        cursor.execute(
+            """
+            INSERT INTO sales (
+                customer_id, total_amount, paid_amount, debt_amount,
+                payment_method, created_at
+            ) VALUES (?, ?, 0, ?, ?, ?)
+            """,
+            (customer_id, amount, amount, PAY_DEBT, created_at),
+        )
+        sale_id = cursor.lastrowid
+        cursor.execute(
+            """
+            INSERT INTO debt_details (sale_id, product_description, amount, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (sale_id, description, amount, created_at),
+        )
+        connection.commit()
+        return sale_id, customer_id
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 def get_customer_debt(customer_id):
     connection = get_connection()
@@ -723,6 +758,88 @@ async def complete_sale(update, context, method, paid):
             lines.append(f"تنبيه: {name} قارب على النفاد، المتبقي {format_qty(left)}")
 
     await update.message.reply_text("\n".join(lines), reply_markup=MAIN_KEYBOARD)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ============================================================
+# تسجيل دين جديد
+# ============================================================
+
+async def new_debt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "اكتب اسم العميل كاملًا:", reply_markup=CANCEL_KEYBOARD
+    )
+    return NEW_DEBT_NAME
+
+
+async def new_debt_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = normalize_name(update.message.text)
+    if not name:
+        await update.message.reply_text("اكتب اسم العميل.")
+        return NEW_DEBT_NAME
+
+    customer = get_customer_by_name(name)
+    if customer:
+        customer_id = customer["id"]
+        saved_name = customer["name"]
+    else:
+        customer_id = None
+        saved_name = name
+
+    context.user_data["new_debt_customer_id"] = customer_id
+    context.user_data["new_debt_customer_name"] = saved_name
+    await update.message.reply_text(
+        f"العميل: {saved_name}\nاكتب اسم المنتج أو وصف ما أخذه:"
+    )
+    return NEW_DEBT_ITEM
+
+
+async def new_debt_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    description = normalize_name(update.message.text)
+    if not description:
+        await update.message.reply_text("اكتب اسم المنتج أو وصفه.")
+        return NEW_DEBT_ITEM
+
+    context.user_data["new_debt_description"] = description
+    await update.message.reply_text("اكتب قيمة الدين:")
+    return NEW_DEBT_AMOUNT
+
+
+async def new_debt_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    amount = parse_amount(update.message.text)
+    if amount is None or amount <= 0:
+        await update.message.reply_text("أدخل مبلغًا صحيحًا أكبر من صفر.")
+        return NEW_DEBT_AMOUNT
+
+    data = context.user_data
+    try:
+        sale_id, customer_id = register_direct_debt(
+            data["new_debt_customer_id"],
+            data["new_debt_customer_name"],
+            data["new_debt_description"],
+            amount,
+        )
+        balance = get_customer_debt(customer_id)
+    except Exception as error:
+        logger.exception("register direct debt failed")
+        await update.message.reply_text(
+            f"تعذر تسجيل الدين: {error}", reply_markup=MAIN_KEYBOARD
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "تم تسجيل الدين بنجاح.\n\n"
+        f"رقم السجل: {sale_id}\n"
+        f"العميل: {data['new_debt_customer_name']}\n"
+        f"المنتج/الوصف: {data['new_debt_description']}\n"
+        f"المبلغ: {money(amount)}\n"
+        f"التاريخ: {now()}\n"
+        f"إجمالي دين العميل الآن: {money(balance)}",
+        reply_markup=MAIN_KEYBOARD,
+    )
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1252,71 +1369,50 @@ async def report(update, kind):
 
     connection = get_connection()
     try:
-        sales = connection.execute(
+        debts = connection.execute(
             f"""
-            SELECT
-                COUNT(*) AS invoices,
-                COALESCE(SUM(total_amount), 0) AS total_sales,
-                COALESCE(SUM(paid_amount), 0) AS paid,
-                COALESCE(SUM(debt_amount), 0) AS new_debt
-            FROM sales s WHERE {cond_sales}
+            SELECT COUNT(*) AS count, COALESCE(SUM(d.amount), 0) AS amount
+            FROM debt_details d JOIN sales s ON s.id = d.sale_id
+            WHERE {cond_sales}
             """,
             (param,),
         ).fetchone()
-
-        debt_payments = connection.execute(
-            f"SELECT COALESCE(SUM(amount), 0) FROM payments WHERE {cond_plain}",
-            (param,),
-        ).fetchone()[0]
-
-        profit = connection.execute(
+        entries = connection.execute(
             f"""
-            SELECT COALESCE(SUM(si.line_total - si.unit_cost * si.quantity), 0)
-            FROM sale_items si JOIN sales s ON s.id = si.sale_id
+            SELECT COALESCE(c.name, 'عميل محذوف') AS customer,
+                   d.product_description AS description, d.amount, d.created_at
+            FROM debt_details d
+            JOIN sales s ON s.id = d.sale_id
+            LEFT JOIN customers c ON c.id = s.customer_id
             WHERE {cond_sales}
-            """,
-            (param,),
-        ).fetchone()[0]
-
-        top = connection.execute(
-            f"""
-            SELECT si.product_name AS name,
-                   SUM(si.quantity) AS qty,
-                   SUM(si.line_total) AS revenue
-            FROM sale_items si JOIN sales s ON s.id = si.sale_id
-            WHERE {cond_sales}
-            GROUP BY si.product_name
-            ORDER BY revenue DESC LIMIT 5
+            ORDER BY d.created_at, d.sale_id
             """,
             (param,),
         ).fetchall()
+        payments = connection.execute(
+            f"SELECT COALESCE(SUM(amount), 0) FROM payments WHERE {cond_plain}",
+            (param,),
+        ).fetchone()[0]
     finally:
         connection.close()
 
+    outstanding = sum(debt for _, _, debt in all_customer_debts())
     lines = [
         f"{title} — {param}",
         "",
-        f"عدد الفواتير: {sales['invoices']}",
-        f"إجمالي المبيعات: {money(sales['total_sales'])}",
-        f"المقبوض من المبيعات: {money(sales['paid'])}",
-        f"تسديد ديون: {money(debt_payments)}",
-        f"إجمالي المقبوض: {money(sales['paid'] + debt_payments)}",
-        f"ديون جديدة: {money(sales['new_debt'])}",
-        f"الربح التقريبي: {money(profit)}",
+        f"عدد الديون المسجلة: {debts['count']}",
+        f"قيمة الديون المسجلة: {money(debts['amount'])}",
+        f"التسديدات المسجلة: {money(payments)}",
+        f"إجمالي الديون القائمة حاليًا: {money(outstanding)}",
     ]
-
-    if top:
-        lines.append("\nأكثر المنتجات مبيعًا:")
-        for row in top:
+    if entries:
+        lines.append(chr(10) + "تفاصيل الديون:")
+        for row in entries:
             lines.append(
-                f"{row['name']} — {format_qty(row['qty'])} — {money(row['revenue'])}"
+                f"{row['customer']} — {row['description']} — {money(row['amount'])} — {row['created_at']}"
             )
 
-    lines.append(
-        "\nالربح = سعر البيع ناقص التكلفة المسجلة، ويكون صحيحًا بقدر دقة التكاليف المدخلة."
-    )
-
-    await update.message.reply_text("\n".join(lines))
+    await send_long(update, "", lines)
 
 
 async def today_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1342,70 +1438,49 @@ def build_excel(path):
         summary = workbook.active
         summary.title = "الملخص"
 
-        scalar = lambda sql: connection.execute(sql).fetchone()[0]
-
-        total_sales = scalar("SELECT COALESCE(SUM(total_amount),0) FROM sales")
-        total_paid = scalar("SELECT COALESCE(SUM(paid_amount),0) FROM sales")
-        total_payments = scalar("SELECT COALESCE(SUM(amount),0) FROM payments")
-        total_profit = scalar(
-            "SELECT COALESCE(SUM(line_total - unit_cost * quantity),0) FROM sale_items"
-        )
-        stock_value = scalar(
-            "SELECT COALESCE(SUM(stock * cost),0) FROM products WHERE is_active = 1"
-        )
         current_debt = sum(d for _, _, d in all_customer_debts())
+        total_registered = connection.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM debt_details"
+        ).fetchone()[0]
+        total_payments = connection.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM payments"
+        ).fetchone()[0]
 
         for row in [
-            [f"تقرير {SHOP_NAME}", ""],
-            ["تاريخ الإنشاء", now()],
-            ["", ""],
-            ["إجمالي المبيعات", total_sales],
-            ["المدفوع وقت البيع", total_paid],
-            ["تسديد الديون", total_payments],
-            ["إجمالي المقبوض", total_paid + total_payments],
+            [f"دفتر ديون {SHOP_NAME}", ""],
+            ["تاريخ إنشاء النسخة", now()],
+            ["إجمالي الديون المسجلة تاريخيًا", total_registered],
+            ["إجمالي التسديدات", total_payments],
             ["إجمالي الديون الحالية", current_debt],
-            ["الربح التقريبي الكلي", round(total_profit)],
-            ["قيمة المخزون بسعر التكلفة", round(stock_value)],
         ]:
             summary.append(row)
 
         sheets = [
             (
-                "المنتجات",
-                ["رقم", "المنتج", "سعر البيع", "التكلفة", "المخزون", "فعال"],
-                "SELECT id, name, price, cost, stock, is_active FROM products ORDER BY name",
-            ),
-            (
-                "العملاء",
-                ["رقم", "العميل", "الدين الحالي"],
+                "العملاء والرصيد",
+                ["رقم العميل", "اسم العميل", "الدين الحالي"],
                 None,
             ),
             (
-                "الفواتير",
-                ["رقم", "التاريخ", "العميل", "الإجمالي", "المدفوع", "الدين", "الطريقة"],
+                "سجل الديون",
+                ["رقم السجل", "التاريخ", "العميل", "المنتج أو الوصف", "المبلغ"],
                 """
-                SELECT s.id, s.created_at, COALESCE(c.name, 'نقدي'),
-                       s.total_amount, s.paid_amount, s.debt_amount, s.payment_method
-                FROM sales s LEFT JOIN customers c ON c.id = s.customer_id
-                ORDER BY s.id
+                SELECT s.id, d.created_at, COALESCE(c.name, 'عميل محذوف'),
+                       d.product_description, d.amount
+                FROM debt_details d
+                JOIN sales s ON s.id = d.sale_id
+                LEFT JOIN customers c ON c.id = s.customer_id
+                ORDER BY d.created_at, s.id
                 """,
             ),
             (
-                "تفاصيل الفواتير",
-                ["رقم الفاتورة", "المنتج", "الكمية", "سعر الوحدة", "التكلفة", "الإجمالي"],
-                """
-                SELECT sale_id, product_name, quantity, unit_price, unit_cost, line_total
-                FROM sale_items ORDER BY sale_id, id
-                """,
-            ),
-            (
-                "تسديد الديون",
-                ["رقم", "التاريخ", "العميل", "المبلغ", "الطريقة"],
+                "التسديدات",
+                ["رقم التسديد", "التاريخ", "العميل", "المبلغ", "الطريقة"],
                 """
                 SELECT p.id, p.created_at, COALESCE(c.name, 'عميل محذوف'),
                        p.amount, p.payment_method
                 FROM payments p LEFT JOIN customers c ON c.id = p.customer_id
-                ORDER BY p.id
+                ORDER BY p.created_at, p.id
                 """,
             ),
         ]
@@ -1431,7 +1506,7 @@ def build_excel(path):
                 )
                 sheet.column_dimensions[
                     get_column_letter(column_cells[0].column)
-                ].width = min(max(longest + 2, 12), 35)
+                ].width = min(max(longest + 2, 12), 40)
 
         workbook.save(path)
     finally:
@@ -1466,7 +1541,7 @@ def make_backup_files():
     if integrity != "ok":
         raise RuntimeError(f"فشل فحص سلامة القاعدة: {integrity}")
 
-    required = {"customers", "products", "sales", "sale_items", "payments"}
+    required = {"customers", "sales", "payments", "debt_details"}
     if not required.issubset(tables):
         raise RuntimeError("النسخة لا تحتوي على الجداول الأساسية.")
 
@@ -1560,7 +1635,7 @@ async def delete_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"العميل: {customer['name']}\n"
-        "سيُحذف من قائمة العملاء، وتبقى فواتيره وتسديداته في التقارير دون اسم.\n"
+        "سيُحذف من قائمة العملاء، وتبقى سجلات ديونه وتسديداته دون اسم.\n"
         "سأرسل لك نسخة احتياطية قبل الحذف.\n\n"
         "للتأكيد اكتب: نعم\nللإلغاء اكتب: لا"
     )
@@ -1694,27 +1769,15 @@ def run_render_webhook(application):
     """تشغيل البوت عبر Webhook على خدمة Render Web Service."""
     base_url = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
     if not base_url.startswith("https://"):
-        raise RuntimeError(
-            "WEBHOOK_URL أو RENDER_EXTERNAL_URL يجب أن يكون رابطًا عامًا يبدأ بـ https://"
-        )
-
+        raise RuntimeError("WEBHOOK_URL أو RENDER_EXTERNAL_URL يجب أن يبدأ بـ https://")
     secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
-        raise RuntimeError(
-            "اضبط TELEGRAM_WEBHOOK_SECRET على رمز من 1 إلى 256 حرفًا/رقمًا أو _ أو -."
-        )
-
+        raise RuntimeError("اضبط TELEGRAM_WEBHOOK_SECRET على رمز آمن صالح.")
     path = (os.getenv("WEBHOOK_PATH", "telegram").strip().strip("/") or "telegram")
     port = int(os.getenv("PORT", "10000"))
-    webhook_url = f"{base_url}/{path}"
-
-    logger.info("Starting Telegram webhook on 0.0.0.0:%s at /%s", port, path)
     application.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=path,
-        webhook_url=webhook_url,
-        secret_token=secret,
+        listen="0.0.0.0", port=port, url_path=path,
+        webhook_url=f"{base_url}/{path}", secret_token=secret,
         bootstrap_retries=-1,
     )
 
@@ -1735,6 +1798,7 @@ def main():
         raise RuntimeError("TELEGRAM_TOKEN غير موجود في متغيرات البيئة.")
 
     init_database()
+    ensure_debt_details_table()
 
     application = Application.builder().token(TOKEN).build()
     application.add_error_handler(on_error)
@@ -1749,14 +1813,10 @@ def main():
 
     application.add_handler(CommandHandler("start", start, filters=ALLOWED))
 
-    application.add_handler(conversation(BTN_SALE, sale_start, {
-        SALE_ITEM: text_state(sale_item),
-        SALE_PICK: text_state(sale_item),
-        SALE_QTY: text_state(sale_qty),
-        SALE_MORE: text_state(sale_more),
-        SALE_CUSTOMER: text_state(sale_customer),
-        SALE_PAYMENT: text_state(sale_payment),
-        SALE_PAID: text_state(sale_paid),
+    application.add_handler(conversation(BTN_DEBT_NEW, new_debt_start, {
+        NEW_DEBT_NAME: text_state(new_debt_name),
+        NEW_DEBT_ITEM: text_state(new_debt_item),
+        NEW_DEBT_AMOUNT: text_state(new_debt_amount),
     }))
 
     application.add_handler(conversation(BTN_DEBT_PAY, debt_start, {
@@ -1765,37 +1825,11 @@ def main():
         DEBT_METHOD: text_state(debt_method),
     }))
 
-    application.add_handler(conversation(BTN_ADD_PRODUCT, product_add_start, {
-        PROD_NAME: text_state(product_add_name),
-        PROD_PRICE: text_state(product_add_price),
-        PROD_COST: text_state(product_add_cost),
-        PROD_STOCK: text_state(product_add_stock),
-    }))
-
-    application.add_handler(conversation(BTN_RESTOCK, restock_start, {
-        RESTOCK_ITEM: text_state(restock_item),
-        RESTOCK_PICK: text_state(restock_item),
-        RESTOCK_QTY: text_state(restock_qty),
-        RESTOCK_COST: text_state(restock_cost),
-    }))
-
-    application.add_handler(conversation(BTN_PRICE, price_start, {
-        PRICE_ITEM: text_state(price_item),
-        PRICE_PICK: text_state(price_item),
-        PRICE_VALUE: text_state(price_value),
-    }))
-
-    application.add_handler(conversation(BTN_SEARCH, search_start, {
-        SEARCH_NAME: text_state(search_name),
-    }))
-
     application.add_handler(conversation(BTN_DELETE, delete_start, {
         DELETE_NAME: text_state(delete_name),
         DELETE_CONFIRM: text_state(delete_confirm),
     }))
 
-    application.add_handler(MessageHandler(button(BTN_PRODUCTS), products_list))
-    application.add_handler(MessageHandler(button(BTN_LOW), low_stock_list))
     application.add_handler(MessageHandler(button(BTN_CUSTOMERS), customers_list))
     application.add_handler(MessageHandler(button(BTN_DEBTS), debts_list))
     application.add_handler(MessageHandler(button(BTN_TODAY), today_report))
